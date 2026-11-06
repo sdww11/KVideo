@@ -1,18 +1,22 @@
-import { Redis } from '@upstash/redis';
 import { NextRequest, NextResponse } from 'next/server';
+import { getRedisClient } from '@/lib/server/redis';
+import { getRuntimeEnvValue } from '@/lib/server/runtime-env';
 import { getRuntimeFeatures } from '@/lib/server/runtime-features';
 import {
   createStoredAccount,
   ensureUniqueUsername,
   hashPassword,
+  isBootstrapAdminCredential,
   normalizeUsername,
   parseBootstrapAccounts,
   resolveLoginMode,
+  shouldUseSecureSessionCookie,
   signSessionPayload,
   verifyPassword,
   verifySessionToken,
   type LoginMode,
   type SeedAccountInput,
+  type SessionCookieProtocolRequest,
   type SessionPayload,
   type StoredAccountRecord,
 } from '@/lib/server/auth-helpers';
@@ -83,30 +87,24 @@ const DANMAKU_API_URL = process.env.DANMAKU_API_URL || process.env.NEXT_PUBLIC_D
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30;
 const MANAGED_AUTH_FORCED = process.env.MANAGED_AUTH_ENABLED === 'true';
 
-const effectiveAdminPassword = ADMIN_PASSWORD || ACCESS_PASSWORD;
+function getEffectiveAdminPassword(): string {
+  return getRuntimeEnvValue('ADMIN_PASSWORD', ADMIN_PASSWORD) ||
+    getRuntimeEnvValue('ACCESS_PASSWORD', ACCESS_PASSWORD);
+}
 
-let cachedRedis: Redis | null | undefined;
-
-function getRedisClient(): Redis | null {
-  if (cachedRedis !== undefined) {
-    return cachedRedis;
+export class ManagedAuthStorageError extends Error {
+  constructor(operation: 'read' | 'write', cause?: unknown) {
+    super(`Managed auth storage ${operation} failed`, { cause });
+    this.name = 'ManagedAuthStorageError';
   }
-
-  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
-    cachedRedis = null;
-    return cachedRedis;
-  }
-
-  cachedRedis = Redis.fromEnv();
-  return cachedRedis;
 }
 
 function isManagedAuthEnabled(): boolean {
-  return !!AUTH_SECRET && !!getRedisClient();
+  return !!getRuntimeEnvValue('AUTH_SECRET', AUTH_SECRET) && !!getRedisClient();
 }
 
 function isLegacyAuthConfigured(): boolean {
-  return !!(effectiveAdminPassword || ACCOUNTS);
+  return !!(getEffectiveAdminPassword() || ACCOUNTS);
 }
 
 function isStoredAccountRecord(value: unknown): value is StoredAccountRecord {
@@ -138,23 +136,33 @@ async function readManagedAccounts(): Promise<StoredAccountRecord[]> {
     const stored = await redis.get(MANAGED_ACCOUNTS_KEY);
     if (!Array.isArray(stored)) return [];
     return stored.filter(isStoredAccountRecord).map(normalizeStoredAccount);
-  } catch {
-    return [];
+  } catch (error) {
+    console.error('Managed auth Redis read failed:', error);
+    throw new ManagedAuthStorageError('read', error);
   }
 }
 
 async function saveManagedAccounts(accounts: StoredAccountRecord[]): Promise<void> {
   const redis = getRedisClient();
   if (!redis) {
-    throw new Error('Managed auth storage unavailable');
+    throw new ManagedAuthStorageError(
+      'write',
+      new Error('Managed auth storage unavailable')
+    );
   }
 
-  await redis.set(MANAGED_ACCOUNTS_KEY, accounts);
+  try {
+    await redis.set(MANAGED_ACCOUNTS_KEY, accounts);
+  } catch (error) {
+    console.error('Managed auth Redis write failed:', error);
+    throw new ManagedAuthStorageError('write', error);
+  }
 }
 
 function getBootstrapSeeds(): SeedAccountInput[] {
   const seeds: SeedAccountInput[] = [];
   const usernames = new Set<string>();
+  const effectiveAdminPassword = getEffectiveAdminPassword();
 
   if (effectiveAdminPassword) {
     usernames.add('admin');
@@ -224,7 +232,7 @@ export async function getPublicAuthConfig(): Promise<PublicAuthConfig> {
   const loginMode = resolveLoginMode({
     managedAccountCount,
     managedAuthEnabled,
-    managedAuthForced: MANAGED_AUTH_FORCED,
+    managedAuthForced: getRuntimeEnvValue('MANAGED_AUTH_ENABLED') === 'true' || MANAGED_AUTH_FORCED,
     legacyAuthConfigured: isLegacyAuthConfigured(),
   });
 
@@ -250,12 +258,13 @@ async function generateLegacyProfileId(password: string): Promise<string> {
 }
 
 function resolveSessionSecret(loginMode: LoginMode): string | null {
-  if (AUTH_SECRET) {
-    return AUTH_SECRET;
+  const authSecret = getRuntimeEnvValue('AUTH_SECRET', AUTH_SECRET);
+  if (authSecret) {
+    return authSecret;
   }
 
   if (loginMode === 'legacy_password' && isLegacyAuthConfigured()) {
-    return `legacy:${effectiveAdminPassword}:${ACCOUNTS}:${PREMIUM_PASSWORD}`;
+    return `legacy:${getEffectiveAdminPassword()}:${ACCOUNTS}:${PREMIUM_PASSWORD}`;
   }
 
   return null;
@@ -319,27 +328,6 @@ export async function getServerSession(request: NextRequest): Promise<ServerAuth
   return sessionPayloadToServerSession(payload);
 }
 
-function applySessionCookie(response: NextResponse, token: string, persist: boolean): void {
-  response.cookies.set(SESSION_COOKIE_NAME, token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
-    path: '/',
-    ...(persist ? { maxAge: SESSION_MAX_AGE_SECONDS } : {}),
-  });
-}
-
-export function clearSessionCookie(response: NextResponse): NextResponse {
-  response.cookies.set(SESSION_COOKIE_NAME, '', {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
-    path: '/',
-    maxAge: 0,
-  });
-  return response;
-}
-
 export function hasServerPermission(session: ServerAuthSession, permission: Permission): boolean {
   return hasResolvedPermission(session.role, permission, session.customPermissions);
 }
@@ -352,12 +340,43 @@ async function authenticateManagedLogin(username: string, password: string): Pro
   const normalizedUsername = normalizeUsername(username);
   if (!normalizedUsername || !password) return null;
 
-  const accounts = await ensureManagedAccountsBootstrapped();
-  const account = accounts.find((item) => item.username === normalizedUsername);
-  if (!account) return null;
+  const usesBootstrapAdminCredential = isBootstrapAdminCredential(
+    normalizedUsername,
+    password,
+    getEffectiveAdminPassword()
+  );
 
-  const valid = await verifyPassword(password, account.passwordSalt, account.passwordHash);
-  if (!valid) return null;
+  const accounts = await ensureManagedAccountsBootstrapped();
+  let account = accounts.find((item) => item.username === normalizedUsername);
+
+  if (!account) {
+    if (!usesBootstrapAdminCredential) return null;
+
+    account = await createStoredAccount({
+      username: 'admin',
+      password,
+      name: '超级管理员',
+      role: 'super_admin',
+      customPermissions: [],
+    });
+    await saveManagedAccounts([...accounts, account]);
+  } else {
+    const valid = await verifyPassword(password, account.passwordSalt, account.passwordHash);
+    if (!valid) {
+      if (!usesBootstrapAdminCredential) return null;
+
+      const nextPassword = await hashPassword(password);
+      account = {
+        ...account,
+        passwordHash: nextPassword.hash,
+        passwordSalt: nextPassword.salt,
+        updatedAt: Date.now(),
+      };
+      await saveManagedAccounts(
+        accounts.map((item) => item.id === account?.id ? account : item)
+      );
+    }
+  }
 
   return {
     accountId: account.id,
@@ -373,6 +392,7 @@ async function authenticateManagedLogin(username: string, password: string): Pro
 
 async function authenticateLegacyLogin(password: string): Promise<ServerAuthSession | null> {
   if (!password) return null;
+  const effectiveAdminPassword = getEffectiveAdminPassword();
 
   if (effectiveAdminPassword && password === effectiveAdminPassword) {
     return {
@@ -457,7 +477,10 @@ export async function validatePremiumAccess(
   return authenticateLegacyAdminCredential(body.password);
 }
 
-export async function createLoginResponse(session: ServerAuthSession): Promise<NextResponse> {
+export async function createLoginResponse(
+  session: ServerAuthSession,
+  request?: SessionCookieProtocolRequest,
+): Promise<NextResponse> {
   const config = await getPublicAuthConfig();
   const token = await signSession(session, config.loginMode);
   if (!token) {
@@ -470,7 +493,13 @@ export async function createLoginResponse(session: ServerAuthSession): Promise<N
     ...config,
   });
 
-  applySessionCookie(response, token, PERSIST_SESSION);
+  response.cookies.set(SESSION_COOKIE_NAME, token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: shouldUseSecureSessionCookie(request),
+    path: '/',
+    ...(PERSIST_SESSION ? { maxAge: SESSION_MAX_AGE_SECONDS } : {}),
+  });
   return response;
 }
 
@@ -485,8 +514,16 @@ export async function createSessionStatusResponse(request: NextRequest): Promise
   });
 }
 
-export function logoutResponse(): NextResponse {
-  return clearSessionCookie(NextResponse.json({ success: true }));
+export function logoutResponse(request?: SessionCookieProtocolRequest): NextResponse {
+  const response = NextResponse.json({ success: true });
+  response.cookies.set(SESSION_COOKIE_NAME, '', {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: shouldUseSecureSessionCookie(request),
+    path: '/',
+    maxAge: 0,
+  });
+  return response;
 }
 
 export async function listAccountInfo(): Promise<AccountInfo[]> {
@@ -508,7 +545,7 @@ export async function listAccountInfo(): Promise<AccountInfo[]> {
   const legacyAccounts: AccountInfo[] = [];
   let index = 0;
 
-  if (effectiveAdminPassword) {
+  if (getEffectiveAdminPassword()) {
     legacyAccounts.push({
       id: 'legacy-admin',
       username: 'admin',
